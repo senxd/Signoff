@@ -1,7 +1,7 @@
 import { Octokit } from "@octokit/rest";
 import { env } from "../config/env";
 import type { CompletionContract } from "../contracts";
-import { createInstallationAccessToken } from "./app";
+import { resolveGithubTokenForRepo } from "./app";
 
 export type GithubArtifactResult = {
   skipped: boolean;
@@ -44,19 +44,16 @@ function repoParts(job: CompletionContract) {
   return { owner, repo };
 }
 
-async function githubVerifierToken() {
-  const installationId = Number(env.githubAppInstallationId);
-  if (Number.isInteger(installationId) && installationId > 0 && env.githubAppPrivateKey) {
-    return createInstallationAccessToken({
-      installationId,
-      role: "verifier",
-    });
-  }
-  return env.githubToken;
+async function githubVerifierToken(job: CompletionContract) {
+  return resolveGithubTokenForRepo({
+    repoFullName: job.repoFullName,
+    sender: job.requestedBy,
+    role: "verifier",
+  });
 }
 
 export async function createVerificationCheck(job: CompletionContract) {
-  const token = await githubVerifierToken();
+  const token = await githubVerifierToken(job);
   const headSha = job.artifacts.implementationSha;
   if (!token || !headSha) {
     return {

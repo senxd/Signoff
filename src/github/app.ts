@@ -1,4 +1,7 @@
 import { createHmac, createSign, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { env } from "../config/env";
 
 type GitHubRepository = {
@@ -33,6 +36,35 @@ export type GitHubInstallationTokenRole = "survey" | "executor" | "verifier";
 const pendingConnections = new Map<string, GitHubConnection>();
 const connectionsById = new Map<string, GitHubConnection>();
 const connectionBySender = new Map<string, string>();
+
+const connectionsFile = join(
+  env.signoffStateDir ?? (existsSync("/opt/signoff") ? "/opt/signoff/state" : "/private/tmp/signoff-state"),
+  "github-connections.json",
+);
+
+async function persistConnections() {
+  await mkdir(join(connectionsFile, ".."), { recursive: true });
+  await writeFile(
+    connectionsFile,
+    `${JSON.stringify([...connectionsById.values()], null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function loadPersistedConnections() {
+  try {
+    const raw = await readFile(connectionsFile, "utf8");
+    const connections = JSON.parse(raw) as GitHubConnection[];
+    for (const connection of connections) {
+      connectionsById.set(connection.connectionId, connection);
+      connectionBySender.set(connection.sender, connection.connectionId);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+void loadPersistedConnections();
 
 function now() {
   return new Date().toISOString();
@@ -300,6 +332,7 @@ export async function completeGitHubConnection(params: {
 
   pendingConnections.delete(payload.connectionId);
   connectionBySender.set(connection.sender, connection.connectionId);
+  await persistConnections();
   return connection;
 }
 
@@ -310,6 +343,13 @@ export function getGitHubConnection(connectionId: string) {
 export function getGitHubConnectionForSender(sender: string) {
   const connectionId = connectionBySender.get(sender);
   return connectionId ? connectionsById.get(connectionId) : undefined;
+}
+
+export function resolveInstallationIdForSender(sender?: string) {
+  const fromEnv = Number(env.githubAppInstallationId);
+  if (Number.isInteger(fromEnv) && fromEnv > 0) return fromEnv;
+  if (!sender) return undefined;
+  return getGitHubConnectionForSender(sender)?.installationId;
 }
 
 export async function createInstallationAccessToken(params: {
@@ -345,4 +385,32 @@ export async function createInstallationAccessToken(params: {
     },
   );
   return data.token;
+}
+
+async function installationTokenCanAccessRepo(token: string, repoFullName: string) {
+  const response = await fetch(`https://api.github.com/repos/${repoFullName}`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+    },
+  });
+  return response.ok;
+}
+
+export async function resolveGithubTokenForRepo(params: {
+  repoFullName: string;
+  sender?: string;
+  role: GitHubInstallationTokenRole;
+}) {
+  const installationId = resolveInstallationIdForSender(params.sender);
+  if (Number.isInteger(installationId) && installationId! > 0 && env.githubAppPrivateKey) {
+    const token = await createInstallationAccessToken({
+      installationId: installationId!,
+      role: params.role,
+    });
+    if (await installationTokenCanAccessRepo(token, params.repoFullName)) {
+      return token;
+    }
+  }
+  return env.githubToken;
 }

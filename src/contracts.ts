@@ -4,7 +4,7 @@ import { z } from "zod";
 export const completionContractInputSchema = z.object({
   goal: z.string().min(8),
   repoUrl: z.string().url().optional(),
-  repoFullName: z.string().default("senxd/finance-2"),
+  repoFullName: z.string().default("senxd/signoff-demo-app"),
   baseBranch: z.string().default("main"),
   baseCommitSha: z.string().optional(),
   previewUrl: z.string().url().optional(),

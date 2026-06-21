@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { Octokit } from "@octokit/rest";
 import type { CompletionContract } from "../contracts";
 import { env } from "../config/env";
-import { createInstallationAccessToken } from "../github/app";
+import { resolveGithubTokenForRepo } from "../github/app";
 
 export type ExecutorResult = {
   buildPassed: boolean;
@@ -19,6 +19,7 @@ export type ExecutorResult = {
 };
 
 const execFileAsync = promisify(execFile);
+const DEMO_REPO = "senxd/signoff-demo-app";
 
 export async function runExistingCodingExecutor(
   contract: CompletionContract,
@@ -27,12 +28,12 @@ export async function runExistingCodingExecutor(
 
   if (!webhook) {
     if (
-      contract.repoFullName === "senxd/finance-2" &&
+      contract.repoFullName === DEMO_REPO &&
       (contract.demoFixture === "watchlist_mobile" ||
         contract.demoFixture === "watchlist_mobile_failure" ||
         contract.demoFixture === "watchlist_mobile_repair")
     ) {
-      return runPreparedFinanceWatchlistExecutor(contract);
+      return runPreparedWatchlistExecutor(contract);
     }
 
     throw new Error("Executor webhook is not configured and no prepared executor matches this contract.");
@@ -51,33 +52,14 @@ export async function runExistingCodingExecutor(
   return (await response.json()) as ExecutorResult;
 }
 
-async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract): Promise<ExecutorResult> {
-  const sourceRepo = pickExistingPath([
-    env.financeRepoMain,
-    "/opt/signoff/repos/finance-2-main",
-    "/path/to/finance",
-  ]);
-  if (!sourceRepo) {
-    throw new Error("No finance-2 source checkout found for prepared executor.");
-  }
-
+async function runPreparedWatchlistExecutor(contract: CompletionContract): Promise<ExecutorResult> {
   const jobsRoot = env.signoffJobsDir ?? (existsSync("/opt/signoff") ? "/opt/signoff/jobs" : "/private/tmp/signoff-jobs");
   await mkdir(jobsRoot, { recursive: true });
   const jobDir = join(jobsRoot, `${contract.id}-attempt-${contract.repairAttempts}`);
   await rm(jobDir, { recursive: true, force: true });
 
   const branchName = `signoff/${slugFor(contract.goal)}-${contract.id.toLowerCase()}`;
-  await run("git", [
-    "-c",
-    `safe.directory=${sourceRepo}`,
-    "-c",
-    `safe.directory=${join(sourceRepo, ".git")}`,
-    "clone",
-    "--shared",
-    sourceRepo,
-    jobDir,
-  ]);
-  await run("git", ["-C", jobDir, "-c", `safe.directory=${jobDir}`, "fetch", "origin", contract.baseBranch]);
+  await cloneContractRepo(contract, jobDir);
   await run("git", [
     "-C",
     jobDir,
@@ -86,7 +68,7 @@ async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract)
     "checkout",
     "-B",
     branchName,
-    `origin/${contract.baseBranch}`,
+    contract.baseCommitSha ?? `origin/${contract.baseBranch}`,
   ]);
 
   if (
@@ -110,7 +92,15 @@ async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract)
   });
   const buildPassed = build.exitCode === 0;
 
-  await run("git", ["-C", jobDir, "-c", `safe.directory=${jobDir}`, "add", "src/components/watchlist/watchlist-shell.tsx"]);
+  await run("git", [
+    "-C",
+    jobDir,
+    "-c",
+    `safe.directory=${jobDir}`,
+    "add",
+    "src/components/watchlist/watchlist-shell.tsx",
+    "src/app/globals.css",
+  ]);
   await run("git", ["-C", jobDir, "-c", `safe.directory=${jobDir}`, "config", "user.name", "Signoff"]);
   await run("git", [
     "-C",
@@ -132,9 +122,14 @@ async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract)
   ]);
   const commitSha = (await run("git", ["-C", jobDir, "-c", `safe.directory=${jobDir}`, "rev-parse", "HEAD"])).stdout.trim();
 
-  const gitToken = await githubWriteToken();
+  const gitToken = await githubWriteToken(contract);
   if (!gitToken) {
     throw new Error("No GitHub write token available for pushing the delegated branch.");
+  }
+
+  const [owner, repo] = contract.repoFullName.split("/");
+  if (!owner || !repo) {
+    throw new Error(`Invalid repoFullName: ${contract.repoFullName}`);
   }
 
   await run("git", [
@@ -143,13 +138,15 @@ async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract)
     "-c",
     `safe.directory=${jobDir}`,
     "push",
-    `https://x-access-token:${gitToken}@github.com/senxd/finance-2.git`,
+    `https://x-access-token:${gitToken}@github.com/${owner}/${repo}.git`,
     `${branchName}:${branchName}`,
     "--force",
   ]);
 
   const pullRequestUrl = await openOrUpdatePullRequest({
     token: gitToken,
+    owner,
+    repo,
     branchName,
     contract,
     commitSha,
@@ -176,69 +173,36 @@ async function runPreparedFinanceWatchlistExecutor(contract: CompletionContract)
 }
 
 async function applyWatchlistMobilePatch(repoDir: string) {
-  const file = join(repoDir, "src/components/watchlist/watchlist-shell.tsx");
-  let source = await readFile(file, "utf8");
+  const shellFile = join(repoDir, "src/components/watchlist/watchlist-shell.tsx");
+  const cssFile = join(repoDir, "src/app/globals.css");
+  let source = await readFile(shellFile, "utf8");
   if (source.includes("function WatchlistMobileCards(")) return;
 
   const helper = `
-function fmtWatchlistCurrency(value: number | null) {
-  if (value === null) return "—";
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  }).format(value);
-}
+type WatchlistRow = {
+  symbol: string;
+  name: string;
+  price: string;
+  change: string;
+  volume: string;
+};
 
-function fmtWatchlistPct(value: number | null) {
-  if (value === null) return "—";
-  return \`\${value >= 0 ? "+" : ""}\${value.toFixed(2)}%\`;
-}
-
-function WatchlistMobileCards({ rows }: { rows: PortfolioRow[] }) {
+function WatchlistMobileCards({ rows }: { rows: WatchlistRow[] }) {
   return (
-    <div className="grid gap-3 md:hidden">
+    <div className="watchlist-mobile-cards">
       {rows.map((row) => (
-        <article
-          key={row.id}
-          className="rounded-xl border border-border/70 bg-card p-4 shadow-sm"
-        >
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold tracking-tight">{row.symbol}</h2>
-              <p className="truncate text-xs text-muted-foreground">
-                {row.name ?? "Watchlist ticker"}
-              </p>
+        <article key={row.symbol} className="watchlist-mobile-card">
+          <div className="watchlist-mobile-card-header">
+            <div>
+              <h2>{row.symbol}</h2>
+              <p>{row.name}</p>
             </div>
-            <div className="text-right">
-              <p className="text-sm font-medium">{fmtWatchlistCurrency(row.price)}</p>
-              <p
-                className={
-                  row.dayChangePct !== null && row.dayChangePct < 0
-                    ? "text-xs text-red-500"
-                    : "text-xs text-emerald-600"
-                }
-              >
-                {fmtWatchlistPct(row.dayChangePct)}
-              </p>
+            <div className="watchlist-mobile-card-prices">
+              <p>{row.price}</p>
+              <p className={row.change.startsWith("-") ? "negative" : "positive"}>{row.change}</p>
             </div>
           </div>
-          <dl className="mt-4 grid grid-cols-3 gap-2 text-xs">
-            <div>
-              <dt className="text-muted-foreground">Volume</dt>
-              <dd className="font-medium">
-                {row.volume === null ? "—" : row.volume.toLocaleString()}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">52w high</dt>
-              <dd className="font-medium">{fmtWatchlistCurrency(row.high52)}</dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Sector</dt>
-              <dd className="truncate font-medium">{row.sector ?? "—"}</dd>
-            </div>
-          </dl>
+          <p className="watchlist-mobile-volume">Volume {row.volume}</p>
         </article>
       ))}
     </div>
@@ -246,170 +210,171 @@ function WatchlistMobileCards({ rows }: { rows: PortfolioRow[] }) {
 }
 `;
 
-  source = source.replace("function useWatchlistMarketRows", `${helper}\nfunction useWatchlistMarketRows`);
+  source = source.replace("export function WatchlistShell()", `${helper}\nexport function WatchlistShell()`);
   source = source.replace(
-    `const WATCHLIST_COLUMNS_REGISTRY = {
-  columns: WATCHLIST_COLUMNS,
-  columnById: WATCHLIST_COLUMN_BY_ID,
-  alwaysVisible: WATCHLIST_ALWAYS_VISIBLE,
-  defaultVisibleColumnIds: DEFAULT_WATCHLIST_VISIBLE_COLUMN_IDS,
-};
-`,
-    `const WATCHLIST_COLUMNS_REGISTRY = {
-  columns: WATCHLIST_COLUMNS,
-  columnById: WATCHLIST_COLUMN_BY_ID,
-  alwaysVisible: WATCHLIST_ALWAYS_VISIBLE,
-  defaultVisibleColumnIds: DEFAULT_WATCHLIST_VISIBLE_COLUMN_IDS,
-};
+    `      <div className="watchlist-table-frame">
+        <table className="watchlist-table">`,
+    `      <WatchlistMobileCards rows={rows} />
 
-function readGuestWatchlistSymbols() {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(WATCHLIST_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return [
-      ...new Set(
-        parsed
-          .filter((s): s is string => typeof s === "string")
-          .map((s) => s.toUpperCase())
-      ),
-    ];
-  } catch {
-    return [];
+      <div className="watchlist-table-frame watchlist-desktop-table">
+        <table className="watchlist-table">`,
+  );
+
+  if (!source.includes("function WatchlistMobileCards(") || !source.includes("watchlist-desktop-table")) {
+    throw new Error("Watchlist mobile patch failed for signoff-demo-app.");
   }
+  await writeFile(shellFile, source, "utf8");
+
+  let css = await readFile(cssFile, "utf8");
+  if (css.includes(".watchlist-mobile-cards")) return;
+
+  css += `
+
+.watchlist-mobile-cards {
+  display: none;
+  gap: 12px;
 }
 
-const SIGNOFF_DEMO_WATCHLIST_SYMBOLS = ["NVDA", "AAPL", "MSFT", "SPY"];
-`,
-  );
-  source = source.replace(
-    `  const [mounted, setMounted] = useState(false);
-  const [guestSymbols, setGuestSymbols] = useState<string[]>([]);
-  const [guestHydrated, setGuestHydrated] = useState(false);`,
-    `  const [mounted, setMounted] = useState(() => typeof window !== "undefined");
-  const [guestSymbols, setGuestSymbols] = useState<string[]>(() => readGuestWatchlistSymbols());
-  const [guestHydrated, setGuestHydrated] = useState(() => typeof window !== "undefined");`,
-  );
-  source = source.replace(
-    `<div
-          className={
-            quotesLoading ? "opacity-80 transition-opacity" : "opacity-100"
-          }
-        >
-          <HoldingsTable`,
-    `<div
-          className={
-            quotesLoading ? "opacity-80 transition-opacity" : "opacity-100"
-          }
-        >
-          <WatchlistMobileCards rows={tableRows} />
-          <div className="hidden md:block">
-            <HoldingsTable`,
-  );
-  source = source.replace(
-    `            showFooter={false}
-          />
-        </div>
-      )}`,
-    `            showFooter={false}
-          />
-          </div>
-        </div>
-      )}`,
-  );
-  source = source.replace(
-    `    if (isSignedIn || (authPending && watchlistDoc)) {
-      return watchlistDoc?.symbols ?? [];
-    }
-    return guestSymbols;
-  }, [mounted, authPending, isSignedIn, watchlistDoc, guestSymbols]);`,
-    `    if (!mounted) return SIGNOFF_DEMO_WATCHLIST_SYMBOLS;
-    const currentGuestSymbols =
-      guestSymbols.length > 0 ? guestSymbols : readGuestWatchlistSymbols();
-    if (currentGuestSymbols.length > 0) return currentGuestSymbols;
-    if (isSignedIn) {
-      return watchlistDoc?.symbols ?? [];
-    }
-    return SIGNOFF_DEMO_WATCHLIST_SYMBOLS;
-  }, [mounted, isSignedIn, watchlistDoc, guestSymbols]);`,
-  );
-  source = source.replace(
-    `    if (!mounted) return [];
-    if (!mounted) return SIGNOFF_DEMO_WATCHLIST_SYMBOLS;`,
-    `    if (!mounted) return SIGNOFF_DEMO_WATCHLIST_SYMBOLS;`,
-  );
-  source = source.replace(
-    `  const listReady =
-    mounted &&
-    !(
-      ((isSignedIn || authPending) && watchlistDoc === undefined) ||
-      (!isSignedIn && !authPending && !guestHydrated)
-    );`,
-    `  const hasGuestSymbols = guestSymbols.length > 0;
-  const listReady =
-    !isSignedIn ||
-    (mounted &&
-      (hasGuestSymbols ||
-      !(
-        (isSignedIn && watchlistDoc === undefined) ||
-        (!isSignedIn && !guestHydrated)
-      )));`,
-  );
+.watchlist-mobile-card {
+  background: white;
+  border: 1px solid #d8dee9;
+  border-radius: 12px;
+  padding: 16px;
+}
 
-  if (
-    !source.includes("function WatchlistMobileCards(") ||
-    !source.includes("function readGuestWatchlistSymbols()") ||
-    !source.includes("const hasGuestSymbols = guestSymbols.length > 0;") ||
-    source.includes("if (!mounted) return []") ||
-    source.includes("isSignedIn || (authPending && watchlistDoc)") ||
-    source.includes("((isSignedIn || authPending) && watchlistDoc === undefined)")
-  ) {
-    throw new Error("Watchlist mobile patch failed to insert helper or guest loading guard.");
+.watchlist-mobile-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.watchlist-mobile-card h2 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.watchlist-mobile-card p {
+  margin: 0;
+}
+
+.watchlist-mobile-card-prices {
+  text-align: right;
+}
+
+.watchlist-mobile-volume {
+  color: #536075;
+  font-size: 13px;
+  margin-top: 12px;
+}
+
+@media (max-width: 767px) {
+  .watchlist-mobile-cards {
+    display: grid;
   }
-  await writeFile(file, source, "utf8");
+
+  .watchlist-desktop-table {
+    display: none;
+  }
+}
+`;
+  await writeFile(cssFile, css, "utf8");
 }
 
 async function applyWatchlistFakeMobilePatch(repoDir: string) {
-  const file = join(repoDir, "src/components/watchlist/watchlist-shell.tsx");
-  let source = await readFile(file, "utf8");
+  const shellFile = join(repoDir, "src/components/watchlist/watchlist-shell.tsx");
+  const cssFile = join(repoDir, "src/app/globals.css");
+  let source = await readFile(shellFile, "utf8");
   if (source.includes("SIGNOFF_FAKE_MOBILE_OPTIMIZED")) return;
 
   source = source.replace(
-    `  return (
-    <div className="mx-auto flex w-full max-w-[1200px] flex-col gap-5 px-4 py-8 md:px-6">`,
-    `  return (
-    <div className="SIGNOFF_FAKE_MOBILE_OPTIMIZED mx-auto flex w-full min-w-[927px] max-w-[1200px] flex-col gap-5 px-4 py-8 md:px-6">
-      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-900">
-        Mobile optimized
-      </div>`,
+    `<section className="watchlist-shell">`,
+    `<section className="watchlist-shell SIGNOFF_FAKE_MOBILE_OPTIMIZED">
+      <div className="watchlist-fake-mobile-banner">Mobile optimized</div>`,
   );
 
-  if (
-    !source.includes("SIGNOFF_FAKE_MOBILE_OPTIMIZED") ||
-    !source.includes("min-w-[927px]") ||
-    source.includes("function WatchlistMobileCards(")
-  ) {
-    throw new Error("Watchlist fake mobile patch failed to create the intended overflow-only failure.");
+  if (!source.includes("SIGNOFF_FAKE_MOBILE_OPTIMIZED")) {
+    throw new Error("Watchlist fake mobile patch failed for signoff-demo-app.");
   }
+  await writeFile(shellFile, source, "utf8");
 
-  await writeFile(file, source, "utf8");
+  let css = await readFile(cssFile, "utf8");
+  if (css.includes(".SIGNOFF_FAKE_MOBILE_OPTIMIZED")) return;
+
+  css += `
+
+.watchlist-shell.SIGNOFF_FAKE_MOBILE_OPTIMIZED {
+  min-width: 927px;
 }
 
-async function githubWriteToken() {
-  const installationId = Number(env.githubAppInstallationId);
-  if (Number.isInteger(installationId) && installationId > 0 && env.githubAppPrivateKey) {
-    return createInstallationAccessToken({
-      installationId,
-      role: "executor",
-    });
+.watchlist-fake-mobile-banner {
+  background: #fff7e6;
+  border: 1px solid #f0d093;
+  border-radius: 8px;
+  color: #7a4b00;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+`;
+  await writeFile(cssFile, css, "utf8");
+}
+
+async function cloneContractRepo(contract: CompletionContract, jobDir: string) {
+  const sourceRepo = pickExistingPath([
+    env.demoRepoMain,
+    "/opt/signoff/repos/signoff-demo-app-main",
+  ]);
+
+  if (sourceRepo) {
+    await run("git", [
+      "-c",
+      `safe.directory=${sourceRepo}`,
+      "-c",
+      `safe.directory=${join(sourceRepo, ".git")}`,
+      "clone",
+      "--shared",
+      sourceRepo,
+      jobDir,
+    ]);
+    await run("git", ["-C", jobDir, "-c", `safe.directory=${jobDir}`, "fetch", "origin", contract.baseBranch]);
+    return;
   }
-  return env.githubToken;
+
+  const token = await githubWriteToken(contract);
+  if (!token) {
+    throw new Error(
+      "No GitHub credentials available to clone the repo. Set GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY, connect GitHub via /github/connect/start, or set GITHUB_TOKEN with repo access.",
+    );
+  }
+
+  const [owner, repo] = contract.repoFullName.split("/");
+  if (!owner || !repo) {
+    throw new Error(`Invalid repoFullName: ${contract.repoFullName}`);
+  }
+
+  await run("git", [
+    "clone",
+    "--depth",
+    "1",
+    "--branch",
+    contract.baseBranch,
+    `https://x-access-token:${token}@github.com/${owner}/${repo}.git`,
+    jobDir,
+  ]);
+}
+
+async function githubWriteToken(contract: CompletionContract) {
+  return resolveGithubTokenForRepo({
+    repoFullName: contract.repoFullName,
+    sender: contract.requestedBy,
+    role: "executor",
+  });
 }
 
 async function openOrUpdatePullRequest(params: {
   token: string;
+  owner: string;
+  repo: string;
   branchName: string;
   contract: CompletionContract;
   commitSha: string;
@@ -428,17 +393,17 @@ async function openOrUpdatePullRequest(params: {
   ].join("\n");
 
   const existing = await octokit.rest.pulls.list({
-    owner: "senxd",
-    repo: "finance-2",
-    head: `senxd:${params.branchName}`,
+    owner: params.owner,
+    repo: params.repo,
+    head: `${params.owner}:${params.branchName}`,
     state: "open",
   });
 
   if (existing.data[0]) {
     const pr = existing.data[0];
     await octokit.rest.pulls.update({
-      owner: "senxd",
-      repo: "finance-2",
+      owner: params.owner,
+      repo: params.repo,
       pull_number: pr.number,
       title,
       body,
@@ -447,8 +412,8 @@ async function openOrUpdatePullRequest(params: {
   }
 
   const pr = await octokit.rest.pulls.create({
-    owner: "senxd",
-    repo: "finance-2",
+    owner: params.owner,
+    repo: params.repo,
     title,
     head: params.branchName,
     base: params.contract.baseBranch,
@@ -465,7 +430,7 @@ async function startPreview(repoDir: string, jobId: string, commitSha: string, b
   await startDetached(
     repoDir,
     logPath,
-    ["bun", "run", "dev:frontend", "--", "-p", String(port)],
+    ["bun", "run", "dev", "--", "-p", String(port)],
     {
       ...previewEnv,
       NODE_OPTIONS: "--max-old-space-size=1536",
@@ -541,30 +506,8 @@ async function waitForTunnelUrl(logPath: string, timeoutMs: number) {
   throw new Error(`Cloudflare preview tunnel did not produce a public URL. Last log: ${lastLog.slice(-1200)}`);
 }
 
-async function loadPreviewEnv(repoDir: string) {
-  const envFiles = [
-    "/opt/signoff/secrets/finance-preview.env",
-    join(repoDir, ".env.local"),
-    join(repoDir, ".env"),
-  ];
-  const allowed = new Set([
-    "NEXT_PUBLIC_CONVEX_URL",
-    "NEXT_PUBLIC_CONVEX_SITE_URL",
-    "CONVEX_SITE_URL",
-  ]);
-  const values: Record<string, string> = {};
-  for (const file of envFiles) {
-    if (!existsSync(file)) continue;
-    const text = await readFile(file, "utf8");
-    for (const line of text.split(/\r?\n/)) {
-      const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
-      if (!match) continue;
-      const [, key, rawValue] = match;
-      if (!key || !allowed.has(key)) continue;
-      values[key] = rawValue?.replace(/^['"]|['"]$/g, "") ?? "";
-    }
-  }
-  return values;
+async function loadPreviewEnv(_repoDir: string) {
+  return {};
 }
 
 async function waitForHttp(url: string, timeoutMs: number) {

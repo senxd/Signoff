@@ -9,7 +9,7 @@ import {
 function baseContract() {
   const contract = createInitialContract("policy-demo", {
     goal: "Make the Watchlist page work well on mobile by showing a compact card layout below 640px.",
-    repoFullName: "senxd/finance-2",
+    repoFullName: "senxd/signoff-demo-app",
     baseBranch: "main",
     stack: "nextjs",
     price: "$20.00 completion authorization",

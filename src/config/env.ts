@@ -5,7 +5,7 @@ export const env = {
   host: process.env.HOST ?? "127.0.0.1",
   publicBaseUrl: process.env.PUBLIC_BASE_URL ?? "http://localhost:8787",
   executorWebhookUrl: process.env.EXECUTOR_WEBHOOK_URL,
-  financeRepoMain: process.env.FINANCE_REPO_MAIN,
+  demoRepoMain: process.env.DEMO_REPO_MAIN ?? process.env.FINANCE_REPO_MAIN,
   signoffJobsDir: process.env.SIGNOFF_JOBS_DIR,
   signoffStateDir: process.env.SIGNOFF_STATE_DIR,
   redisUrl: process.env.REDIS_URL,

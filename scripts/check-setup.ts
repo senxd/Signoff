@@ -198,7 +198,7 @@ function checkFetchAndRunner() {
   present("DIGITALOCEAN_ACCESS_TOKEN");
   present("RUNNER_BASE_URL", { required: false });
   present("RUNNER_SHARED_SECRET");
-  present("FINANCE_REPO_MAIN", { required: false });
+  present("DEMO_REPO_MAIN", { required: false });
   present("SIGNOFF_JOBS_DIR", { required: false });
   present("SIGNOFF_STATE_DIR", { required: false });
   present("DIGITALOCEAN_DROPLET_IP");
@@ -216,8 +216,6 @@ function checkFetchAndRunner() {
   present("OPENAI_API_KEY", { required: false });
   present("ANTHROPIC_API_KEY", { required: false });
   present("EXECUTOR_MODEL");
-  present("FINANCE_TEST_EMAIL");
-  present("FINANCE_TEST_PASSWORD");
   present("REDIS_URL", { required: false });
 }
 
