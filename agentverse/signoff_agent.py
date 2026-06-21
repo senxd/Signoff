@@ -15,6 +15,7 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
+load_dotenv("/opt/signoff/secrets/control.env")
 load_dotenv()
 
 AGENT_NAME = os.getenv("AGENT_NAME", "signoff")
