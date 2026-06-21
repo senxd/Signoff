@@ -1,6 +1,13 @@
 import os
+import sys
+
+if not os.path.exists("/opt/signoff") and os.getenv("FORCE_LOCAL_AGENT") != "1":
+    print("Local agent execution disabled to prevent conflicts with droplet.")
+    sys.exit(0)
+
 import re
 import asyncio
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -28,6 +35,13 @@ POLL_INTERVAL_SEC = int(os.getenv("SIGNOFF_POLL_INTERVAL_SEC", "5"))
 POLL_TIMEOUT_SEC = int(os.getenv("SIGNOFF_POLL_TIMEOUT_SEC", str(30 * 60)))
 
 active_polls: set[str] = set()
+
+# Python 3.14+ requires an explicit event loop (get_event_loop no longer creates one)
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
 agent_config = {
     "name": AGENT_NAME,
@@ -85,8 +99,8 @@ def format_job_summary(job: dict) -> str:
     for criterion in job.get("criteria", []):
         evidence = evidence_by_id.get(criterion["id"], {})
         status = evidence.get("status", "pending")
-        observed = evidence.get("observed") or evidence.get("error")
-        suffix = f" — {observed}" if observed else ""
+        error = evidence.get("error")
+        suffix = f" — {error}" if error else ""
         evidence_lines.append(f"- {criterion['id']}: {status}{suffix}")
 
     outcome = verdict.get("outcome", "pending")
@@ -94,25 +108,23 @@ def format_job_summary(job: dict) -> str:
     if outcome == "satisfied":
         opener = "Done. The accepted checks passed, so this is ready for review."
     elif outcome == "not_satisfied":
-        opener = "I can’t sign off on this yet. The implementation ran, but one of the accepted checks failed."
+        opener = "I can't sign off on this yet. The implementation ran, but one of the accepted checks failed."
     elif outcome == "verification_error":
-        opener = "I can’t sign off on this yet. Verification did not produce reliable enough evidence."
+        opener = "I can't sign off on this yet. Verification did not produce reliable enough evidence."
     elif status in {"building", "verifying", "authorized"}:
-        opener = "It’s in progress. I’ll keep the contract fixed and verify the finished commit before release."
+        opener = "It's in progress. I'll keep the contract fixed and verify the finished commit before release."
     else:
-        opener = "Here’s the latest on this Signoff job."
+        opener = "Here's the latest on this Signoff job."
 
     return (
         f"{opener}\n\n"
-        f"Job `{job['id']}` · `{status}`\n"
-        f"Verdict: `{outcome}`\n"
-        f"Payment: `{job['payment']['status']}`\n"
-        f"Merge eligible: `{verdict.get('mergeEligible', False)}`\n"
-        f"Payment eligible: `{verdict.get('paymentEligible', False)}`\n\n"
-        f"PR: {job['artifacts'].get('pullRequestUrl', 'pending')}\n"
-        f"Proof: {job['artifacts']['proofPageUrl']}\n"
+        f"Job **{job['id']}** · **{status}**\n\n"
+        f"Verdict: **{outcome}** · Payment: **{job['payment']['status']}**\n\n"
+        f"Merge eligible: **{verdict.get('mergeEligible', False)}** · Payment eligible: **{verdict.get('paymentEligible', False)}**\n\n"
+        f"PR: {job['artifacts'].get('pullRequestUrl', 'pending')}\n\n"
+        f"Proof: {job['artifacts']['proofPageUrl']}\n\n"
         f"Browser replay: {job['artifacts'].get('browserbaseReplayUrl', 'pending')}\n\n"
-        "Checks:\n"
+        "Checks:\n\n"
         + ("\n".join(evidence_lines) if evidence_lines else "Not run yet.")
     )
 
@@ -135,6 +147,7 @@ def is_greeting(goal: str) -> bool:
         "howdy",
         "sup",
         "gm",
+        "ping",
         "good morning",
         "good afternoon",
         "good evening",
@@ -157,6 +170,117 @@ def sync_job_payment(job_id: str) -> dict | None:
         return None
 
 
+def fetch_job_events(job_id: str) -> list:
+    try:
+        response = requests.get(f"{ORCHESTRATOR_URL}/jobs/{job_id}/events", timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return []
+
+
+def get_latest_failed_reason(job_id: str, attempt: int) -> str:
+    try:
+        events = fetch_job_events(job_id)
+        for event in reversed(events):
+            if event.get("type") == "repair.started":
+                data = event.get("data") or {}
+                if data.get("repairAttempts") == attempt:
+                    verdict = data.get("verdict") or {}
+                    reason = verdict.get("reason")
+                    if reason:
+                        return reason
+    except Exception:
+        pass
+    return "One of the frozen checks failed."
+
+
+def get_duration_sec(start_iso: str, end_iso: str) -> int:
+    try:
+        s = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        e = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        return max(1, int((e - s).total_seconds()))
+    except Exception:
+        return 0
+
+
+def format_job_timeline(events: list) -> str:
+    attempts = []
+    current_attempt = None
+    
+    # Sort events by timestamp
+    events = sorted(events, key=lambda e: e.get("at", ""))
+    
+    has_auth = False
+    for event in events:
+        etype = event.get("type")
+        at = event.get("at", "")
+        data = event.get("data") or {}
+        
+        if etype == "payment.authorized":
+            has_auth = True
+            
+        elif etype == "build.started":
+            attempt_num = data.get("repairAttempts", 0) + 1
+            current_attempt = {
+                "number": attempt_num,
+                "build_start": at,
+                "build_end": None,
+                "verify_start": None,
+                "verify_end": None,
+                "failed_reason": None,
+                "success": False
+            }
+            attempts.append(current_attempt)
+            
+        elif etype == "build.finished" and current_attempt:
+            current_attempt["build_end"] = at
+            
+        elif etype == "browserbase.started" and current_attempt:
+            current_attempt["verify_start"] = at
+            
+        elif etype == "browserbase.finished" and current_attempt:
+            current_attempt["verify_end"] = at
+            
+        elif etype == "repair.started" and current_attempt:
+            current_attempt["failed_reason"] = data.get("verdict", {}).get("reason") or "One of the checks failed."
+            
+        elif etype == "contract.release_eligible" and current_attempt:
+            current_attempt["success"] = True
+            
+    lines = ["**Progress Timeline:**"]
+    if has_auth:
+        lines.append("•  Stripe Payment Authorized")
+        
+    for att in attempts:
+        num = att["number"]
+        lines.append(f"• **Attempt {num}**:")
+        
+        # Build phase
+        if att["build_end"]:
+            dur = get_duration_sec(att["build_start"], att["build_end"])
+            lines.append(f"  - Coding/Building completed ({dur}s)")
+        elif att["build_start"]:
+            lines.append("  - ⟳ Coding/Building... (in progress)")
+            continue
+            
+        # Verify phase
+        if att["verify_end"]:
+            dur = get_duration_sec(att["verify_start"], att["verify_end"])
+            lines.append(f"  - Visual Verification completed ({dur}s)")
+        elif att["verify_start"]:
+            lines.append("  - ⟳ Visual Verification... (in progress)")
+            continue
+            
+        # Outcome
+        if att["failed_reason"]:
+            lines.append(f"  - Failed: {att['failed_reason']}")
+        elif att["success"]:
+            lines.append("  - Verification Passed! Payment captured.")
+            
+    return "\n".join(lines)
+
+
 async def poll_job_updates(ctx: Context, sender: str, job_id: str):
     if job_id in active_polls:
         return
@@ -168,7 +292,10 @@ async def poll_job_updates(ctx: Context, sender: str, job_id: str):
 
     try:
         while datetime.now(timezone.utc).timestamp() < deadline:
-            await asyncio.to_thread(sync_job_payment, job_id)
+            # Only sync payment while waiting for authorization; after that
+            # just read the job so we don't clobber building/verifying status.
+            if not notified_payment:
+                await asyncio.to_thread(sync_job_payment, job_id)
             try:
                 job = await asyncio.to_thread(fetch_job, job_id)
             except Exception:
@@ -194,24 +321,27 @@ async def poll_job_updates(ctx: Context, sender: str, job_id: str):
                 and status in {"building", "verifying"}
             ):
                 notified_repair_attempt = repair_attempts
-                reason = job.get("verdict", {}).get("reason", "One of the frozen checks failed.")
+                events = await asyncio.to_thread(fetch_job_events, job_id)
+                timeline = format_job_timeline(events)
                 await ctx.send(
                     sender,
                     text_message(
-                        f"Attempt {repair_attempts} was not satisfied: {reason}\n\n"
-                        f"I'm running repair attempt {repair_attempts + 1} under the same frozen contract.\n\n"
-                        f"Job `{job_id}` · `{status}`"
+                        f"Attempt {repair_attempts} was not satisfied.\n\n"
+                        f"{timeline}\n\n"
+                        f"Running repair attempt {repair_attempts + 1} under the same frozen contract."
                     ),
                 )
 
             if status in {"building", "verifying"} and notified_status != status:
                 notified_status = status
-                phase = "Building" if status == "building" else "Verifying in Browserbase"
+                events = await asyncio.to_thread(fetch_job_events, job_id)
+                timeline = format_job_timeline(events)
                 await ctx.send(
                     sender,
                     text_message(
-                        f"{phase}. I'll message you when the proof run finishes.\n\n"
-                        f"Job `{job_id}` · `{status}`"
+                        f"Job status updated to **{status}**.\n\n"
+                        f"{timeline}\n\n"
+                        f"Job **{job_id}** · Proof page: {job['artifacts']['proofPageUrl']}"
                     ),
                 )
 
@@ -223,7 +353,7 @@ async def poll_job_updates(ctx: Context, sender: str, job_id: str):
                 await ctx.send(
                     sender,
                     text_message(
-                        f"Stripe authorization did not complete (`{payment}`). "
+                        f"Stripe authorization did not complete (**{payment}**). "
                         f"You can reopen checkout from the proof page and try again.\n\n"
                         f"Proof: {job['artifacts']['proofPageUrl']}"
                     ),
@@ -247,8 +377,8 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(
             sender,
             text_message(
-                "Tell me the feature you want shipped, and I’ll turn it into a fixed completion contract.\n\n"
-                "Example: “Make the Watchlist page work well on mobile while preserving the desktop table.”"
+                "Tell me the feature you want shipped, and I'll turn it into a fixed completion contract.\n\n"
+                "Example: 'Make the Watchlist page work well on mobile while preserving the desktop table.'"
             ),
         )
         return
@@ -267,17 +397,17 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             response.raise_for_status()
             job = response.json()
         except Exception as exc:
-            await ctx.send(sender, text_message(f"I couldn’t approve that contract yet: {exc}"))
+            await ctx.send(sender, text_message(f"I couldn't approve that contract yet: {exc}"))
             return
 
         await ctx.send(
             sender,
             text_message(
-                "Approved. I froze the contract, so the executor can’t change the checks later.\n\n"
-                f"Contract hash: `{job.get('contractHash')}`\n"
-                f"Payment link: {job['payment'].get('checkoutUrl', 'not configured')}\n"
+                "Approved. I froze the contract, so the executor can't change the checks later.\n\n"
+                f"Contract hash: **{job.get('contractHash')}**\n\n"
+                f"Payment link: {job['payment'].get('checkoutUrl', 'not configured')}\n\n"
                 f"Proof page: {job['artifacts']['proofPageUrl']}\n\n"
-                "Authorize the Stripe test payment when you’re ready. I’ll start the work after authorization, "
+                "Authorize the Stripe test payment when you're ready. I'll start the work after authorization, "
                 "then capture only if Browserbase verifies the accepted criteria."
             ),
         )
@@ -290,7 +420,7 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             response.raise_for_status()
             job = response.json()
         except Exception as exc:
-            await ctx.send(sender, text_message(f"I couldn’t find that job yet: {exc}"))
+            await ctx.send(sender, text_message(f"I couldn't find that job yet: {exc}"))
             return
 
         await ctx.send(sender, text_message(format_job_summary(job)))
@@ -300,8 +430,8 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(
             sender,
             text_message(
-                "Tell me the feature you want shipped, and I’ll turn it into a fixed completion contract.\n\n"
-                "Example: “Make the Watchlist page work well on mobile while preserving the desktop table.”"
+                "Tell me the feature you want shipped, and I'll turn it into a fixed completion contract.\n\n"
+                "Example: 'Make the Watchlist page work well on mobile while preserving the desktop table.'"
             ),
         )
         return
@@ -313,7 +443,6 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
                 "goal": goal,
                 "stack": "nextjs",
                 "requestedBy": sender,
-                "price": "demo-completion-credit",
             },
             timeout=30,
         )
@@ -322,7 +451,7 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     except Exception as exc:
         await ctx.send(
             sender,
-            text_message(f"I couldn’t draft the completion contract yet: {exc}"),
+            text_message(f"I couldn't draft the completion contract yet: {exc}"),
         )
         return
 
@@ -331,14 +460,12 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         text_message(
             "Sure. I can take this as a fixed-price delivery task.\n\n"
             "GitHub is connected for the demo repo, so I inspected the supported Next.js target and drafted "
-            "the checks I’ll use to decide whether the work is actually done.\n\n"
-            f"Job `{job['id']}`\n"
-            f"Repo: `{job['repoFullName']}`\n"
-            f"Estimated price: `{job['price']}`\n\n"
-            "I’ll sign off only if these pass:\n"
+            "the checks I'll use to decide whether the work is actually done.\n\n"
+            f"Job **{job['id']}**  ·  Repo: {job.get('repoFullName', 'senxd/signoff-demo-app')}  ·  Estimated price: **{job.get('price', '$20.00 completion authorization')}**\n\n"
+            "I'll sign off only if these pass:\n"
             f"{format_criteria(job)}\n\n"
             "You can adjust the scope now. If this looks right, reply:\n\n"
-            f"`approve {job['id']}`\n\n"
+            f"approve **{job['id']}**\n\n"
             "That freezes the contract, creates the payment authorization, and starts the execution flow."
         ),
     )
@@ -350,6 +477,48 @@ async def handle_chat_acknowledgement(ctx: Context, sender: str, msg: ChatAcknow
 
 
 agent.include(protocol, publish_manifest=True)
+
+
+def find_active_job_ids() -> list[tuple[str, str]]:
+    state_dirs = [
+        os.getenv("SIGNOFF_STATE_DIR"),
+        "/opt/signoff/state",
+        "/private/tmp/signoff-state",
+        "jobs"
+    ]
+    
+    active_ids = []
+    for base in state_dirs:
+        if not base:
+            continue
+        jobs_dir = os.path.join(base, "jobs") if base != "jobs" else "jobs"
+        if os.path.isdir(jobs_dir):
+            try:
+                for filename in os.listdir(jobs_dir):
+                    if filename.endswith(".json") and filename != "test.json":
+                        filepath = os.path.join(jobs_dir, filename)
+                        try:
+                            with open(filepath, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                                status = data.get("status")
+                                requested_by = data.get("requestedBy")
+                                if status in {"payment_pending", "authorized", "building", "verifying"} and requested_by:
+                                    active_ids.append((data["id"], requested_by))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            break
+    return active_ids
+
+
+@agent.on_event("startup")
+async def resume_polls(ctx: Context):
+    ctx.logger.info("Checking for active jobs to resume polling...")
+    active_jobs = await asyncio.to_thread(find_active_job_ids)
+    for job_id, requested_by in active_jobs:
+        ctx.logger.info("Resuming poll loop for active job: %s", job_id)
+        asyncio.create_task(poll_job_updates(ctx, requested_by, job_id))
 
 
 if __name__ == "__main__":
