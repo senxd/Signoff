@@ -59,7 +59,7 @@ def text_message(text: str) -> ChatMessage:
 def format_criteria(job: dict) -> str:
     lines = []
     for criterion in job.get("criteria", []):
-        lines.append(f"- {criterion['id']}: {criterion['description']}")
+        lines.append(f"- {criterion['description']}")
     return "\n".join(lines)
 
 
@@ -77,20 +77,31 @@ def format_job_summary(job: dict) -> str:
         suffix = f" — {observed}" if observed else ""
         evidence_lines.append(f"- {criterion['id']}: {status}{suffix}")
 
+    outcome = verdict.get("outcome", "pending")
+    status = job["status"]
+    if outcome == "satisfied":
+        opener = "Done. The accepted checks passed, so this is ready for review."
+    elif outcome == "not_satisfied":
+        opener = "I can’t sign off on this yet. The implementation ran, but one of the accepted checks failed."
+    elif outcome == "verification_error":
+        opener = "I can’t sign off on this yet. Verification did not produce reliable enough evidence."
+    elif status in {"building", "verifying", "authorized"}:
+        opener = "It’s in progress. I’ll keep the contract fixed and verify the finished commit before release."
+    else:
+        opener = "Here’s the latest on this Signoff job."
+
     return (
-        f"Job: {job['id']}\n"
-        f"Status: {job['status']}\n"
-        f"Contract hash: {job.get('contractHash', 'not approved yet')}\n"
-        f"Verdict: {verdict.get('outcome', 'pending')}\n"
-        f"Merge eligible: {verdict.get('mergeEligible', False)}\n"
-        f"Payment eligible: {verdict.get('paymentEligible', False)}\n"
-        f"Payment state: {job['payment']['status']}\n"
+        f"{opener}\n\n"
+        f"Job `{job['id']}` · `{status}`\n"
+        f"Verdict: `{outcome}`\n"
+        f"Payment: `{job['payment']['status']}`\n"
+        f"Merge eligible: `{verdict.get('mergeEligible', False)}`\n"
+        f"Payment eligible: `{verdict.get('paymentEligible', False)}`\n\n"
         f"PR: {job['artifacts'].get('pullRequestUrl', 'pending')}\n"
-        f"Preview: {job.get('previewUrl', 'pending')}\n"
-        f"Browserbase replay: {job['artifacts'].get('browserbaseReplayUrl', 'pending')}\n"
-        f"Proof page: {job['artifacts']['proofPageUrl']}\n\n"
-        "Criterion results:\n"
-        + ("\n".join(evidence_lines) if evidence_lines else "pending")
+        f"Proof: {job['artifacts']['proofPageUrl']}\n"
+        f"Browser replay: {job['artifacts'].get('browserbaseReplayUrl', 'pending')}\n\n"
+        "Checks:\n"
+        + ("\n".join(evidence_lines) if evidence_lines else "Not run yet.")
     )
 
 
@@ -111,8 +122,8 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(
             sender,
             text_message(
-                "Send a concrete Next.js completion goal, for example: "
-                "'Improve the mobile dashboard layout and verify it.'"
+                "Tell me the feature you want shipped, and I’ll turn it into a fixed completion contract.\n\n"
+                "Example: “Make the Watchlist page work well on mobile while preserving the desktop table.”"
             ),
         )
         return
@@ -131,19 +142,18 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             response.raise_for_status()
             job = response.json()
         except Exception as exc:
-            await ctx.send(sender, text_message(f"I could not approve the contract: {exc}"))
+            await ctx.send(sender, text_message(f"I couldn’t approve that contract yet: {exc}"))
             return
 
         await ctx.send(
             sender,
             text_message(
-                "Contract approved and frozen.\n\n"
-                f"Contract hash: {job.get('contractHash')}\n"
-                f"Stripe Checkout: {job['payment'].get('checkoutUrl', 'not configured')}\n"
-                f"Payment state: {job['payment']['status']}\n\n"
-                "Authorize the Stripe test payment to start execution. I will capture it only if "
-                "the deterministic verdict is satisfied; otherwise I cancel the authorization.\n\n"
-                f"Proof page: {job['artifacts']['proofPageUrl']}"
+                "Approved. I froze the contract, so the executor can’t change the checks later.\n\n"
+                f"Contract hash: `{job.get('contractHash')}`\n"
+                f"Payment link: {job['payment'].get('checkoutUrl', 'not configured')}\n"
+                f"Proof page: {job['artifacts']['proofPageUrl']}\n\n"
+                "Authorize the Stripe test payment when you’re ready. I’ll start the work after authorization, "
+                "then capture only if Browserbase verifies the accepted criteria."
             ),
         )
         return
@@ -154,7 +164,7 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             response.raise_for_status()
             job = response.json()
         except Exception as exc:
-            await ctx.send(sender, text_message(f"I could not retrieve the job: {exc}"))
+            await ctx.send(sender, text_message(f"I couldn’t find that job yet: {exc}"))
             return
 
         await ctx.send(sender, text_message(format_job_summary(job)))
@@ -176,22 +186,24 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     except Exception as exc:
         await ctx.send(
             sender,
-            text_message(f"I could not create the completion contract: {exc}"),
+            text_message(f"I couldn’t draft the completion contract yet: {exc}"),
         )
         return
 
     await ctx.send(
         sender,
         text_message(
-            "Completion contract draft created. Review these frozen checks before work starts.\n\n"
-            f"Job: {job['id']}\n"
-            f"Status: {job['status']}\n"
-            f"Repo: {job['repoFullName']}\n"
-            f"Price: {job['price']}\n"
-            f"Proof page: {job['artifacts']['proofPageUrl']}\n\n"
-            "Criteria:\n"
+            "Sure. I can take this as a fixed-price delivery task.\n\n"
+            "GitHub is connected for the demo repo, so I inspected the supported Next.js target and drafted "
+            "the checks I’ll use to decide whether the work is actually done.\n\n"
+            f"Job `{job['id']}`\n"
+            f"Repo: `{job['repoFullName']}`\n"
+            f"Estimated price: `{job['price']}`\n\n"
+            "I’ll sign off only if these pass:\n"
             f"{format_criteria(job)}\n\n"
-            f"Reply `approve {job['id']}` to freeze the contract hash and create the Stripe authorization."
+            "You can adjust the scope now. If this looks right, reply:\n\n"
+            f"`approve {job['id']}`\n\n"
+            "That freezes the contract, creates the payment authorization, and starts the execution flow."
         ),
     )
 
