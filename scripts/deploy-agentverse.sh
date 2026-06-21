@@ -4,6 +4,7 @@ set -euo pipefail
 CONTROL_ENV="${SIGNOFF_CONTROL_ENV:-/opt/signoff/secrets/control.env}"
 APP_DIR="${SIGNOFF_APP_DIR:-/opt/signoff/app}"
 VENV="${SIGNOFF_VENV:-/opt/signoff/agentverse/.venv/bin/python}"
+AGENT_MAILBOX="${AGENT_MAILBOX:-true}"
 
 set -a
 # shellcheck disable=SC1090
@@ -52,14 +53,21 @@ update_env_var() {
 mkdir -p /opt/signoff/logs
 
 start_tunnel signoff-tunnel 8787 /opt/signoff/logs/orchestrator-tunnel.log
-start_tunnel signoff-agent-tunnel 8001 /opt/signoff/logs/agent-tunnel.log
+if [[ "$AGENT_MAILBOX" == "false" || "$AGENT_MAILBOX" == "0" || "$AGENT_MAILBOX" == "no" ]]; then
+  start_tunnel signoff-agent-tunnel 8001 /opt/signoff/logs/agent-tunnel.log
+else
+  tmux kill-session -t signoff-agent-tunnel 2>/dev/null || true
+fi
 
 PUBLIC_BASE_URL="$(wait_for_tunnel_url /opt/signoff/logs/orchestrator-tunnel.log 90)"
-AGENT_BASE_URL="$(wait_for_tunnel_url /opt/signoff/logs/agent-tunnel.log 90)"
 
 update_env_var ORCHESTRATOR_URL "http://127.0.0.1:8787"
 update_env_var PUBLIC_BASE_URL "$PUBLIC_BASE_URL"
-update_env_var AGENT_ENDPOINT "${AGENT_BASE_URL}/submit"
+update_env_var AGENT_MAILBOX "$AGENT_MAILBOX"
+if [[ "$AGENT_MAILBOX" == "false" || "$AGENT_MAILBOX" == "0" || "$AGENT_MAILBOX" == "no" ]]; then
+  AGENT_BASE_URL="$(wait_for_tunnel_url /opt/signoff/logs/agent-tunnel.log 90)"
+  update_env_var AGENT_ENDPOINT "${AGENT_BASE_URL}/submit"
+fi
 
 chmod 640 "$CONTROL_ENV"
 
@@ -77,9 +85,22 @@ tmux new-session -d -s signoff-agent \
 sleep 4
 
 cd "$APP_DIR"
-"$VENV" scripts/register_chat_agent.py
+if [[ "$AGENT_MAILBOX" == "false" || "$AGENT_MAILBOX" == "0" || "$AGENT_MAILBOX" == "no" ]]; then
+  "$VENV" scripts/register_chat_agent.py
+fi
 
 curl -sf "http://127.0.0.1:8787/health"
+if [[ "$AGENT_MAILBOX" == "false" || "$AGENT_MAILBOX" == "0" || "$AGENT_MAILBOX" == "no" ]]; then
+  agent_status="$(curl -s -o /dev/null -w "%{http_code}" "${AGENT_BASE_URL}/submit" -X POST -H "content-type: application/json" -d '{}')"
+  if [[ "$agent_status" != "400" && "$agent_status" != "200" && "$agent_status" != "422" ]]; then
+    echo "agent tunnel check failed with HTTP ${agent_status}" >&2
+    exit 1
+  fi
+fi
+
 echo
 echo "PUBLIC_BASE_URL=${PUBLIC_BASE_URL}"
-echo "AGENT_ENDPOINT=${AGENT_BASE_URL}/submit"
+echo "AGENT_MAILBOX=${AGENT_MAILBOX}"
+if [[ "$AGENT_MAILBOX" == "false" || "$AGENT_MAILBOX" == "0" || "$AGENT_MAILBOX" == "no" ]]; then
+  echo "AGENT_ENDPOINT=${AGENT_BASE_URL}/submit"
+fi

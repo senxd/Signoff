@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
+import { ZodError } from "zod";
 import {
   approveCompletionJob,
   createCompletionJob,
@@ -34,9 +35,22 @@ app.get("/health", (c) =>
 );
 
 app.post("/jobs", async (c) => {
-  const body = await c.req.json();
-  const job = await createCompletionJob(body);
-  return c.json(job, 202);
+  try {
+    const body = await c.req.json();
+    const job = await createCompletionJob(body);
+    return c.json(job, 202);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "invalid_request",
+          message: error.issues.map((issue) => issue.message).join("; "),
+        },
+        400,
+      );
+    }
+    throw error;
+  }
 });
 
 app.post("/jobs/:id/approve", async (c) => {

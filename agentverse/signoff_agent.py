@@ -21,20 +21,26 @@ load_dotenv()
 AGENT_NAME = os.getenv("AGENT_NAME", "signoff")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8001"))
 AGENT_SEED_PHRASE = os.getenv("AGENT_SEED_PHRASE", "replace-with-a-long-unique-seed")
+AGENT_ENDPOINT = os.getenv("AGENT_ENDPOINT")
+AGENT_MAILBOX = os.getenv("AGENT_MAILBOX", "true").lower() not in {"0", "false", "no"}
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8787")
 POLL_INTERVAL_SEC = int(os.getenv("SIGNOFF_POLL_INTERVAL_SEC", "5"))
 POLL_TIMEOUT_SEC = int(os.getenv("SIGNOFF_POLL_TIMEOUT_SEC", str(30 * 60)))
 
 active_polls: set[str] = set()
 
-agent = Agent(
-    name=AGENT_NAME,
-    seed=AGENT_SEED_PHRASE,
-    port=AGENT_PORT,
-    mailbox=True,
-    publish_agent_details=True,
-    readme_path="agentverse/README.md",
-)
+agent_config = {
+    "name": AGENT_NAME,
+    "seed": AGENT_SEED_PHRASE,
+    "port": AGENT_PORT,
+    "mailbox": AGENT_MAILBOX,
+    "publish_agent_details": True,
+    "readme_path": "agentverse/README.md",
+}
+if not AGENT_MAILBOX and AGENT_ENDPOINT:
+    agent_config["endpoint"] = AGENT_ENDPOINT
+
+agent = Agent(**agent_config)
 
 protocol = Protocol(spec=chat_protocol_spec)
 
