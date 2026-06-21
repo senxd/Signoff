@@ -20,7 +20,7 @@ export const completionContractInputSchema = z.object({
       "paper_account_health",
     ])
     .default("watchlist_mobile"),
-  maxRepairAttempts: z.number().int().min(0).max(2).default(0),
+  maxRepairAttempts: z.number().int().min(0).max(2).default(1),
 });
 
 export type CompletionContractInput = z.infer<typeof completionContractInputSchema>;
@@ -196,18 +196,19 @@ export function createInitialContract(
   id: string,
   input: CompletionContractInput,
 ): CompletionContract {
+  const parsed = completionContractInputSchema.parse(input);
   const now = new Date().toISOString();
 
   return {
     id,
-    ...input,
+    ...parsed,
     contractSchemaVersion: "2026-06-21",
     contractVersion: 1,
     status: "draft",
     repairAttempts: 0,
     createdAt: now,
     updatedAt: now,
-    criteria: createCriteriaForInput(input),
+    criteria: createCriteriaForInput(parsed),
     acceptance: {
       buildPasses: true,
       browserbaseReplayRequired: true,
@@ -223,7 +224,7 @@ export function createInitialContract(
       provider: "stripe",
       status: "unconfigured",
       mode: "test",
-      amountCents: input.quoteAmountCents ?? 0,
+      amountCents: parsed.quoteAmountCents ?? 0,
       currency: "usd",
     },
     verdict: {

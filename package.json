@@ -8,7 +8,9 @@
     "start": "bun index.ts",
     "check": "tsc --noEmit",
     "setup:check": "bun scripts/check-setup.ts",
-    "test:policy": "bun scripts/test-verdict-policy.ts"
+    "test:policy": "bun scripts/test-verdict-policy.ts",
+    "test:repair": "bun scripts/test-repair-setup.ts",
+    "test:repair:e2e": "bun scripts/test-repair-e2e.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

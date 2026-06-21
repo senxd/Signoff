@@ -116,6 +116,26 @@ def extract_job_id(goal: str) -> str | None:
     return match.group(0) if match else None
 
 
+def is_greeting(goal: str) -> bool:
+    normalized = re.sub(r"[^\w\s]", "", goal.lower()).strip()
+    if not normalized:
+        return True
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "hiya",
+        "howdy",
+        "sup",
+        "gm",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+    return normalized in greetings or normalized.startswith(("hi ", "hello ", "hey "))
+
+
 def fetch_job(job_id: str) -> dict:
     response = requests.get(f"{ORCHESTRATOR_URL}/jobs/{job_id}", timeout=30)
     response.raise_for_status()
@@ -137,6 +157,7 @@ async def poll_job_updates(ctx: Context, sender: str, job_id: str):
     active_polls.add(job_id)
     notified_payment = False
     notified_status: str | None = None
+    notified_repair_attempt = 0
     deadline = datetime.now(timezone.utc).timestamp() + POLL_TIMEOUT_SEC
 
     try:
@@ -158,6 +179,22 @@ async def poll_job_updates(ctx: Context, sender: str, job_id: str):
                     text_message(
                         "Payment authorized. I'm starting the executor under the frozen contract.\n\n"
                         f"Proof page: {job['artifacts']['proofPageUrl']}"
+                    ),
+                )
+
+            repair_attempts = job.get("repairAttempts", 0)
+            if (
+                repair_attempts > notified_repair_attempt
+                and status in {"building", "verifying"}
+            ):
+                notified_repair_attempt = repair_attempts
+                reason = job.get("verdict", {}).get("reason", "One of the frozen checks failed.")
+                await ctx.send(
+                    sender,
+                    text_message(
+                        f"Attempt {repair_attempts} was not satisfied: {reason}\n\n"
+                        f"I'm running repair attempt {repair_attempts + 1} under the same frozen contract.\n\n"
+                        f"Job `{job_id}` · `{status}`"
                     ),
                 )
 
@@ -251,6 +288,16 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             return
 
         await ctx.send(sender, text_message(format_job_summary(job)))
+        return
+
+    if is_greeting(goal):
+        await ctx.send(
+            sender,
+            text_message(
+                "Tell me the feature you want shipped, and I’ll turn it into a fixed completion contract.\n\n"
+                "Example: “Make the Watchlist page work well on mobile while preserving the desktop table.”"
+            ),
+        )
         return
 
     try:

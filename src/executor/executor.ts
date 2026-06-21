@@ -52,6 +52,21 @@ export async function runExistingCodingExecutor(
   return (await response.json()) as ExecutorResult;
 }
 
+export function shouldApplyWatchlistFakeMobilePatch(contract: CompletionContract) {
+  if (contract.demoFixture === "watchlist_mobile_failure") return true;
+  if (contract.demoFixture === "watchlist_mobile_repair" && contract.repairAttempts === 0) {
+    return true;
+  }
+  if (
+    contract.demoFixture === "watchlist_mobile" &&
+    contract.maxRepairAttempts > 0 &&
+    contract.repairAttempts === 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function runPreparedWatchlistExecutor(contract: CompletionContract): Promise<ExecutorResult> {
   const jobsRoot = env.signoffJobsDir ?? (existsSync("/opt/signoff") ? "/opt/signoff/jobs" : "/private/tmp/signoff-jobs");
   await mkdir(jobsRoot, { recursive: true });
@@ -71,10 +86,7 @@ async function runPreparedWatchlistExecutor(contract: CompletionContract): Promi
     contract.baseCommitSha ?? `origin/${contract.baseBranch}`,
   ]);
 
-  if (
-    contract.demoFixture === "watchlist_mobile_failure" ||
-    (contract.demoFixture === "watchlist_mobile_repair" && contract.repairAttempts === 0)
-  ) {
+  if (shouldApplyWatchlistFakeMobilePatch(contract)) {
     await applyWatchlistFakeMobilePatch(jobDir);
   } else {
     await applyWatchlistMobilePatch(jobDir);
