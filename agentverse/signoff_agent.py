@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -20,6 +21,10 @@ AGENT_NAME = os.getenv("AGENT_NAME", "signoff")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8001"))
 AGENT_SEED_PHRASE = os.getenv("AGENT_SEED_PHRASE", "replace-with-a-long-unique-seed")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8787")
+POLL_INTERVAL_SEC = int(os.getenv("SIGNOFF_POLL_INTERVAL_SEC", "5"))
+POLL_TIMEOUT_SEC = int(os.getenv("SIGNOFF_POLL_TIMEOUT_SEC", str(30 * 60)))
+
+active_polls: set[str] = set()
 
 agent = Agent(
     name=AGENT_NAME,
@@ -110,6 +115,82 @@ def extract_job_id(goal: str) -> str | None:
     return match.group(0) if match else None
 
 
+def fetch_job(job_id: str) -> dict:
+    response = requests.get(f"{ORCHESTRATOR_URL}/jobs/{job_id}", timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def sync_job_payment(job_id: str) -> dict | None:
+    try:
+        response = requests.post(f"{ORCHESTRATOR_URL}/jobs/{job_id}/payment/sync", timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+
+async def poll_job_updates(ctx: Context, sender: str, job_id: str):
+    if job_id in active_polls:
+        return
+    active_polls.add(job_id)
+    notified_payment = False
+    notified_status: str | None = None
+    deadline = datetime.now(timezone.utc).timestamp() + POLL_TIMEOUT_SEC
+
+    try:
+        while datetime.now(timezone.utc).timestamp() < deadline:
+            await asyncio.to_thread(sync_job_payment, job_id)
+            try:
+                job = await asyncio.to_thread(fetch_job, job_id)
+            except Exception:
+                await asyncio.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            status = job["status"]
+            payment = job["payment"]["status"]
+
+            if payment == "authorized" and not notified_payment:
+                notified_payment = True
+                await ctx.send(
+                    sender,
+                    text_message(
+                        "Payment authorized. I'm starting the executor under the frozen contract.\n\n"
+                        f"Proof page: {job['artifacts']['proofPageUrl']}"
+                    ),
+                )
+
+            if status in {"building", "verifying"} and notified_status != status:
+                notified_status = status
+                phase = "Building" if status == "building" else "Verifying in Browserbase"
+                await ctx.send(
+                    sender,
+                    text_message(
+                        f"{phase}. I'll message you when the proof run finishes.\n\n"
+                        f"Job `{job_id}` · `{status}`"
+                    ),
+                )
+
+            if status in {"completed", "failed"}:
+                await ctx.send(sender, text_message(format_job_summary(job)))
+                return
+
+            if payment in {"cancelled", "failed"} and status not in {"completed", "failed"}:
+                await ctx.send(
+                    sender,
+                    text_message(
+                        f"Stripe authorization did not complete (`{payment}`). "
+                        f"You can reopen checkout from the proof page and try again.\n\n"
+                        f"Proof: {job['artifacts']['proofPageUrl']}"
+                    ),
+                )
+                return
+
+            await asyncio.sleep(POLL_INTERVAL_SEC)
+    finally:
+        active_polls.discard(job_id)
+
+
 @protocol.on_message(model=ChatMessage)
 async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
     await ctx.send(
@@ -156,6 +237,7 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
                 "then capture only if Browserbase verifies the accepted criteria."
             ),
         )
+        asyncio.create_task(poll_job_updates(ctx, sender, job_id))
         return
 
     if ("status" in lowered or "proof" in lowered) and job_id:

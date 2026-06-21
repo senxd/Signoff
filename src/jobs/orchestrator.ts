@@ -72,6 +72,7 @@ export async function approveCompletionJob(jobId: string, approvedBy = "asi-one"
   });
 
   await createStripeCheckout(job);
+  startPaymentPolling(job.id);
   return job;
 }
 
@@ -91,9 +92,48 @@ export async function syncPaymentAndMaybeRun(jobId: string) {
   return job;
 }
 
+const activeJobs = new Set<string>();
+const paymentPollers = new Set<string>();
+
+export function startPaymentPolling(jobId: string) {
+  if (paymentPollers.has(jobId)) return;
+  paymentPollers.add(jobId);
+  void pollPaymentUntilAuthorized(jobId);
+}
+
+async function pollPaymentUntilAuthorized(jobId: string) {
+  const deadline = Date.now() + 30 * 60 * 1000;
+  try {
+    while (Date.now() < deadline) {
+      const job = await store.getJob(jobId);
+      if (!job) return;
+      if (["authorized", "building", "verifying", "completed", "failed"].includes(job.status)) {
+        if (job.status === "authorized" && job.payment.status === "authorized") {
+          void runJob(jobId);
+        }
+        return;
+      }
+      if (["cancelled", "failed", "captured"].includes(job.payment.status)) return;
+
+      await syncStripePayment(jobId);
+      const updated = await store.getJob(jobId);
+      if (updated?.status === "authorized" && updated.payment.status === "authorized") {
+        void runJob(jobId);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  } finally {
+    paymentPollers.delete(jobId);
+  }
+}
+
 export async function runJob(jobId: string) {
+  if (activeJobs.has(jobId)) return;
   const job = await store.getJob(jobId);
   if (!job) return;
+  if (["building", "verifying", "completed", "failed"].includes(job.status)) return;
   if (job.status !== "authorized" || job.payment.status !== "authorized") {
     await event(jobId, "job.waiting_for_payment", "Executor is waiting for Stripe authorization.", {
       jobStatus: job.status,
@@ -102,6 +142,7 @@ export async function runJob(jobId: string) {
     return;
   }
 
+  activeJobs.add(jobId);
   try {
     while (true) {
       await save(job, "building");
@@ -266,5 +307,7 @@ export async function runJob(jobId: string) {
     await cancelStripePayment(job, job.error);
     await save(job, "failed");
     await event(job.id, "job.failed", job.error);
+  } finally {
+    activeJobs.delete(jobId);
   }
 }
